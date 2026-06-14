@@ -1,0 +1,11 @@
+name = "fleet-dashboard-api"
+main = "src/index.ts"
+compatibility_date = "2025-05-01"
+
+# D1 binding — create the database with:
+#   npx wrangler d1 create fleet-telemetry
+# Then paste the returned database_id below.
+[[d1_databases]]
+binding = "DB"
+database_name = "fleet-telemetry"
+database_id = "placeholder-run-wrangler-d1-create"
