@@ -10,6 +10,7 @@
  *   GET  /api/fleet/history  — γ / η time series (last 100 ticks)
  *   GET  /api/benchmark      — 12-language polyglot throughput benchmark
  *   POST /api/fleet/config   — update agent count / coherence bias
+ *   POST /api/fleet/history  — ingest external telemetry push
  */
 
 // ============================================================
@@ -45,6 +46,12 @@ interface HistoryPoint {
 interface FleetConfigUpdate {
   agentCount?: number;
   bias?: number; // maps to coherence ∈ [0, 1]
+}
+
+interface IngestHistoryPoint {
+  tick: number;
+  gamma: number;
+  eta: number;
 }
 
 // ============================================================
@@ -316,6 +323,58 @@ async function updateConfig(request: Request): Promise<Response> {
   });
 }
 
+/**
+ * POST /api/fleet/history — accept external telemetry pushes.
+ *
+ * Writes the incoming γ/η point to the in-memory ring buffer and optionally
+ * persists to D1.  This lets the construct stack feed real data into the
+ * Worker's time-series without relying solely on the internal simulation.
+ */
+async function ingestHistory(request: Request): Promise<Response> {
+  let body: IngestHistoryPoint;
+  try {
+    body = (await request.json()) as IngestHistoryPoint;
+  } catch {
+    return json({ error: 'Invalid JSON body' }, 400);
+  }
+
+  if (typeof body.gamma !== 'number' || typeof body.eta !== 'number') {
+    return json({ error: 'gamma and eta required' }, 400);
+  }
+
+  const gamma = body.gamma;
+  const eta = body.eta;
+  const tick = typeof body.tick === 'number' ? body.tick : sim.tick++;
+
+  // Update live state
+  sim.tick = tick;
+  sim.gamma = gamma;
+  sim.eta = eta;
+
+  // Push into ring buffer
+  sim.gammaHist.push(gamma);
+  sim.etaHist.push(eta);
+  if (sim.gammaHist.length > HISTORY_SIZE) sim.gammaHist.shift();
+  if (sim.etaHist.length > HISTORY_SIZE) sim.etaHist.shift();
+
+  sim.lastTickMs = Date.now();
+
+  // Optional D1 persistence
+  if (_env?.DB && _ctx) {
+    _ctx.waitUntil(
+      _env.DB.prepare(
+        `INSERT OR IGNORE INTO telemetry_ticks (tick, gamma, eta, c_capacity, sigma, agent_count, timestamp)
+         VALUES (?, ?, ?, ?, ?, ?, datetime('now'))`
+      )
+        .bind(tick, gamma, eta, C, sim.sigma, sim.agentCount)
+        .run()
+        .catch(() => {}),
+    );
+  }
+
+  return json({ ok: true, tick, gamma, eta, c: C });
+}
+
 // ============================================================
 // Router
 // ============================================================
@@ -340,6 +399,7 @@ export default {
     if (method === 'GET' && pathname === '/api/fleet/history') return getHistory();
     if (method === 'GET' && pathname === '/api/benchmark') return getBenchmark();
     if (method === 'POST' && pathname === '/api/fleet/config') return updateConfig(request);
+    if (method === 'POST' && pathname === '/api/fleet/history') return ingestHistory(request);
 
     // --- Root info ---
     if (method === 'GET' && (pathname === '/' || pathname === '')) {
@@ -352,6 +412,7 @@ export default {
           'GET  /api/fleet/history',
           'GET  /api/benchmark',
           'POST /api/fleet/config',
+          'POST /api/fleet/history',
         ],
         conservation: 'γ + η = C, C = log₂(3) ≈ 1.585',
       });
